@@ -312,6 +312,10 @@ def _file_to_data_url(path: Path) -> Optional[str]:
     except Exception as exc:
         logger.warning("image_routing: failed to read %s — %s", path, exc)
         return None
+    sniffed = _sniff_mime_from_bytes(raw)
+    if not sniffed:
+        logger.warning("image_routing: skipping non-image bytes for native attachment: %s", path)
+        return None
     mime = _guess_mime(path, raw=raw)
     b64 = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{b64}"

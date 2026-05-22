@@ -571,7 +571,10 @@ class SlackAdapter(BasePlatformAdapter):
 
             # Register each bot token and map team_id → client
             for token in bot_tokens:
-                client = AsyncWebClient(token=token)
+                try:
+                    client = AsyncWebClient(token=token, timeout=120)
+                except TypeError:  # compatibility with lightweight test fakes / older SDKs
+                    client = AsyncWebClient(token=token)
                 _apply_slack_proxy(client, proxy_url)
                 auth_response = await client.auth_test()
                 team_id = auth_response.get("team_id", "")
@@ -1958,9 +1961,35 @@ class SlackAdapter(BasePlatformAdapter):
         #   4. There's an existing session for this thread (survives restarts)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         routing_text = original_text or ""
-        is_mentioned = bot_uid and f"<@{bot_uid}>" in routing_text
+        actual_bot_mention = bool(bot_uid and f"<@{bot_uid}>" in routing_text)
+        pattern_mention = self._slack_matches_mention_pattern(routing_text)
+        is_mentioned = actual_bot_mention or pattern_mention
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
+        reply_to_bot_thread = is_thread_reply and event_thread_ts in self._bot_message_ts
+        in_mentioned_thread = (
+            event_thread_ts is not None
+            and event_thread_ts in self._mentioned_threads
+        )
+        has_session = (
+            is_thread_reply
+            and self._has_active_session_for_thread(
+                channel_id=channel_id,
+                thread_ts=event_thread_ts,
+                user_id=user_id,
+            )
+        )
+        if not is_dm and self._slack_exclusive_mention_user_ids():
+            allowed_thread_followup = (
+                not self._slack_strict_mention()
+                and (reply_to_bot_thread or in_mentioned_thread or has_session)
+            )
+            if (
+                not self._slack_has_exclusive_mention(routing_text)
+                and not allowed_thread_followup
+            ):
+                logger.debug("[Slack] Ignoring message without configured exclusive mention")
+                return
 
         if not is_dm and bot_uid:
             # Check allowed channels — if set, only respond in these channels (whitelist)
@@ -1976,21 +2005,6 @@ class SlackAdapter(BasePlatformAdapter):
             elif self._slack_strict_mention() and not is_mentioned:
                 return  # Strict mode: ignore until @-mentioned again
             elif not is_mentioned:
-                reply_to_bot_thread = (
-                    is_thread_reply and event_thread_ts in self._bot_message_ts
-                )
-                in_mentioned_thread = (
-                    event_thread_ts is not None
-                    and event_thread_ts in self._mentioned_threads
-                )
-                has_session = (
-                    is_thread_reply
-                    and self._has_active_session_for_thread(
-                        channel_id=channel_id,
-                        thread_ts=event_thread_ts,
-                        user_id=user_id,
-                    )
-                )
                 if not reply_to_bot_thread and not in_mentioned_thread and not has_session:
                     return
 
@@ -3009,6 +3023,72 @@ class SlackAdapter(BasePlatformAdapter):
         if s:
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
+
+    def _slack_mention_patterns(self) -> List[re.Pattern]:
+        """Compile optional regex wake-word patterns for Slack channel triggers."""
+        patterns = self.config.extra.get("mention_patterns")
+        if patterns is None:
+            raw = os.getenv("SLACK_MENTION_PATTERNS", "").strip()
+            if raw:
+                try:
+                    loaded = json.loads(raw)
+                except Exception:
+                    loaded = [part.strip() for part in raw.splitlines() if part.strip()]
+                    if not loaded:
+                        loaded = [part.strip() for part in raw.split(",") if part.strip()]
+                patterns = loaded
+
+        if patterns is None:
+            return []
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        if not isinstance(patterns, list):
+            logger.warning(
+                "[%s] slack mention_patterns must be a list or string; got %s",
+                self.name,
+                type(patterns).__name__,
+            )
+            return []
+
+        compiled: List[re.Pattern] = []
+        for pattern in patterns:
+            if not isinstance(pattern, str) or not pattern.strip():
+                continue
+            try:
+                compiled.append(re.compile(pattern, re.IGNORECASE))
+            except re.error as exc:
+                logger.warning("[%s] Invalid Slack mention pattern %r: %s", self.name, pattern, exc)
+        return compiled
+
+    def _slack_matches_mention_pattern(self, text: str) -> bool:
+        """Return whether text matches a configured Slack wake-word pattern."""
+        if not text:
+            return False
+        return any(pattern.search(text) for pattern in self._slack_mention_patterns())
+
+    def _slack_exclusive_mention_user_ids(self) -> set:
+        """Return Slack user IDs that must be directly mentioned to wake this bot.
+
+        When set, channel/group messages are ignored unless they contain one of
+        these exact Slack mention tokens (e.g. ``<@U123>``).  This is stricter
+        than wake-word patterns and prevents one bot from answering another
+        bot's mention in shared threads.
+        """
+        raw = self.config.extra.get("exclusive_mention_user_ids")
+        if raw is None:
+            raw = os.getenv("SLACK_EXCLUSIVE_MENTION_USER_IDS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw or "").split(",") if part.strip()}
+
+    def _slack_has_exclusive_mention(self, text: str) -> bool:
+        """Return True when text directly mentions a configured exclusive ID."""
+        if not text:
+            return False
+        return any(
+            f"<@{user_id}>" in text
+            for user_id in self._slack_exclusive_mention_user_ids()
+        )
 
     def _slack_allowed_channels(self) -> set:
         """Return the whitelist of channel IDs the bot will respond in.
