@@ -85,6 +85,15 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+_SLACK_EMPTY_RESPONSE_LIFECYCLE_STATUS_RE = re.compile(
+    r"("
+    r"empty\s+response\s+from\s+model"
+    r"|model\s+returned\s+empty\s+after\s+tool\s+calls"
+    r"|model\s+returned\s+no\s+content\s+after\s+all\s+retries"
+    r")",
+    re.IGNORECASE,
+)
+
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
     r"("  # infrastructure/provider error preambles, not ordinary assistant prose
     r"api\s+(?:call\s+)?failed"
@@ -302,10 +311,29 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     return redacted
 
 
+def _should_send_gateway_status(platform: Any, event_type: str, message: str) -> bool:
+    """Return False for status callbacks that should stay out of chat.
+
+    Slack threads are user-facing work channels. Empty-response retry/nudge
+    lifecycle messages are useful in logs, but they create noisy visible Slack
+    replies before the gateway either recovers or sends a final answer. Keep
+    them enabled on other platforms for existing operator visibility.
+    """
+    text = str(message or "").strip()
+    if not text:
+        return False
+    if _gateway_platform_value(platform) == "slack" and str(event_type or "").lower() == "lifecycle":
+        if _SLACK_EMPTY_RESPONSE_LIFECYCLE_STATUS_RE.search(text):
+            return False
+    return True
+
+
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery."""
     text = str(message or "").strip()
     if not text:
+        return None
+    if not _should_send_gateway_status(platform, event_type, text):
         return None
     if _gateway_platform_value(platform) != "telegram":
         return text
@@ -1583,6 +1611,8 @@ def _normalize_empty_agent_response(
 
     api_calls = int(agent_result.get("api_calls", 0) or 0)
     if api_calls > 0 and not agent_result.get("interrupted"):
+        if agent_result.get("_suppress_empty_response_notice"):
+            return ""
         if agent_result.get("partial"):
             err = agent_result.get("error", "processing incomplete")
             return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."
@@ -3086,7 +3116,7 @@ class GatewayRunner:
         # creating a session.  The busy path must enforce the same check;
         # otherwise unauthorized users in shared threads (Slack/Telegram/Discord)
         # can inject messages into an active session they don't own.
-        if not self._is_user_authorized(event.source):
+        if not self._is_user_authorized(event.source) and not self._is_slack_group_direct_mention(event):
             logger.warning(
                 "Dropping message from unauthorized user in active session: "
                 "user=%s (%s), platform=%s, session=%s",
@@ -6403,6 +6433,7 @@ class GatewayRunner:
         if source.chat_type in {"group", "forum", "channel"} and source.chat_id:
             chat_allowlist_env = {
                 Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
+                Platform.SLACK: "SLACK_GROUP_ALLOWED_USERS",
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
             }.get(source.platform, "")
             if chat_allowlist_env:
@@ -6443,6 +6474,7 @@ class GatewayRunner:
         }
         platform_group_chat_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
+            Platform.SLACK: "SLACK_GROUP_ALLOWED_USERS",
             Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
         }
         platform_allow_all_map = {
@@ -6586,6 +6618,22 @@ class GatewayRunner:
                 check_ids.add(normalized_user_id)
 
         return bool(check_ids & allowed_ids)
+
+    def _is_slack_group_direct_mention(self, event: MessageEvent) -> bool:
+        """Allow any Slack group/channel member to invoke the bot via @bot.
+
+        Slack's adapter sets ``direct_mention`` only after confirming the text
+        contains the actual bot user mention (``<@BOTID>``). This intentionally
+        does not apply to DMs, shared wake words, or generic thread follow-ups
+        without a fresh direct mention.
+        """
+        source = getattr(event, "source", None)
+        return bool(
+            source
+            and source.platform == Platform.SLACK
+            and source.chat_type in {"group", "channel"}
+            and getattr(event, "direct_mention", False)
+        )
 
     def _get_unauthorized_dm_behavior(self, platform: Optional[Platform]) -> str:
         """Return how unauthorized DMs should be handled for a platform.
@@ -6758,7 +6806,7 @@ class GatewayRunner:
             if not self._is_user_authorized(source):
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
                 return None
-        elif not self._is_user_authorized(source):
+        elif not self._is_user_authorized(source) and not self._is_slack_group_direct_mention(event):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
             if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":

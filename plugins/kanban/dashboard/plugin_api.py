@@ -653,12 +653,17 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                )
+                try:
+                    ok = kanban_db.complete_task(
+                        conn, task_id,
+                        result=payload.result,
+                        summary=payload.summary,
+                        metadata=payload.metadata,
+                    )
+                except kanban_db.StructuredHandoffError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                except kanban_db.HallucinatedCardsError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
@@ -996,12 +1001,20 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if payload.status is not None and not payload.archive:
                     s = payload.status
                     if s == "done":
-                        ok = kanban_db.complete_task(
-                            conn, tid,
-                            result=payload.result,
-                            summary=payload.summary,
-                            metadata=payload.metadata,
-                        )
+                        try:
+                            ok = kanban_db.complete_task(
+                                conn, tid,
+                                result=payload.result,
+                                summary=payload.summary,
+                                metadata=payload.metadata,
+                            )
+                        except (
+                            kanban_db.StructuredHandoffError,
+                            kanban_db.HallucinatedCardsError,
+                        ) as exc:
+                            entry.update(ok=False, error=str(exc))
+                            results.append(entry)
+                            continue
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)
                     elif s == "ready":

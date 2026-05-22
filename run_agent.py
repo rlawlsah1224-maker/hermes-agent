@@ -3278,6 +3278,78 @@ class AIAgent:
         return False
 
     @staticmethod
+    def _normalize_provider_safe_image_parts(api_messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Return a copy of messages with WebP data URLs normalized to JPEG.
+
+        Historical Slack/thread context may already contain ``data:image/webp``
+        parts. Fresh attachments are normalized in ``agent.image_routing``, but
+        old transcript payloads need a final provider-bound safety pass.
+        """
+        import copy
+
+        def _has_webp_data_url(messages: Any) -> bool:
+            for msg in messages or []:
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") == "image_url" and isinstance(part.get("image_url"), dict):
+                        if str(part["image_url"].get("url") or "").startswith("data:image/webp;base64,"):
+                            return True
+                    if part.get("type") == "input_image" and str(part.get("image_url") or "").startswith("data:image/webp;base64,"):
+                        return True
+            return False
+
+        if not _has_webp_data_url(api_messages):
+            return api_messages
+
+        normalized = copy.deepcopy(api_messages)
+        for msg in normalized:
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                url_ref = None
+                if part.get("type") == "image_url" and isinstance(part.get("image_url"), dict):
+                    url_ref = part["image_url"]
+                    url = str(url_ref.get("url") or "")
+                elif part.get("type") == "input_image":
+                    url = str(part.get("image_url") or "")
+                else:
+                    continue
+                if not url.startswith("data:image/webp;base64,"):
+                    continue
+                try:
+                    raw = base64.b64decode(url.split(",", 1)[1])
+                    from PIL import Image
+                    import io
+                    with Image.open(io.BytesIO(raw)) as img:
+                        try:
+                            img.seek(0)
+                        except Exception:
+                            pass
+                        if img.mode in ("RGBA", "LA"):
+                            background = Image.new("RGB", img.size, (255, 255, 255))
+                            background.paste(img, mask=img.getchannel("A"))
+                            img = background
+                        elif img.mode != "RGB":
+                            img = img.convert("RGB")
+                        out = io.BytesIO()
+                        img.save(out, format="JPEG", quality=92)
+                    converted = "data:image/jpeg;base64," + base64.b64encode(out.getvalue()).decode("ascii")
+                except Exception:
+                    continue
+                if url_ref is not None:
+                    url_ref["url"] = converted
+                else:
+                    part["image_url"] = converted
+        return normalized
+
+    @staticmethod
     def _materialize_data_url_for_vision(image_url: str) -> tuple[str, Optional[Path]]:
         header, _, data = str(image_url or "").partition(",")
         mime = "image/jpeg"
@@ -3744,7 +3816,7 @@ class AIAgent:
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Forwarder — see ``agent.chat_completion_helpers.build_api_kwargs``."""
         from agent.chat_completion_helpers import build_api_kwargs
-        return build_api_kwargs(self, api_messages)
+        return build_api_kwargs(self, self._normalize_provider_safe_image_parts(api_messages))
 
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
