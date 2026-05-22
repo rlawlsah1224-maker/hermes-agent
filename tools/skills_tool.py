@@ -1003,10 +1003,17 @@ def skill_view(
                 if found_skill_md.parent.name == name:
                     _record(found_skill_md.parent, found_skill_md)
 
-            # Strategy 3: legacy flat <name>.md files anywhere under the dir.
+            # Strategy 3: legacy flat <name>.md files.  Do not treat support
+            # files nested inside another skill (references/templates/assets)
+            # as independent legacy skills; e.g. ui-ux-design may legitimately
+            # ship references/frontend-design.md while a real frontend-design
+            # skill directory also exists.
             for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md":
-                    _record(None, found_md)
+                if found_md.name == "SKILL.md":
+                    continue
+                if any((parent / "SKILL.md").exists() for parent in found_md.parents if parent != search_dir):
+                    continue
+                _record(None, found_md)
 
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]

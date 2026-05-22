@@ -446,6 +446,20 @@ class TestSkillView:
         assert "not found" in result["error"].lower()
         assert "available_skills" in result
 
+    def test_reference_file_with_skill_name_does_not_collide(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "frontend-design")
+            ux_dir = _make_skill(tmp_path, "ui-ux-design", category="creative")
+            refs_dir = ux_dir / "references"
+            refs_dir.mkdir()
+            (refs_dir / "frontend-design.md").write_text("support note")
+
+            raw = skill_view("frontend-design")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["name"] == "frontend-design"
+
     def test_view_reference_file(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             skill_dir = _make_skill(tmp_path, "my-skill")
