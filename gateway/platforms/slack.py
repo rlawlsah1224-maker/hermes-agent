@@ -1986,6 +1986,7 @@ class SlackAdapter(BasePlatformAdapter):
             )
             if (
                 not self._slack_has_exclusive_mention(routing_text)
+                and not actual_bot_mention
                 and not allowed_thread_followup
             ):
                 logger.debug("[Slack] Ignoring message without configured exclusive mention")
