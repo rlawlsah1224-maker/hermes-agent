@@ -169,39 +169,6 @@ def _event_ts(ev) -> int:
     return int(t or 0)
 
 
-_HANDOFF_REQUIRED_FIELDS = (
-    "result",
-    "evidence",
-    "decisions",
-    "risks",
-    "next_handoff",
-    "badream_context",
-)
-
-
-def _handoff_has_value(value: object) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, (list, tuple, set, dict)):
-        return bool(value)
-    return True
-
-
-def _run_metadata(run) -> dict:
-    meta = _task_field(run, "metadata", {})
-    if isinstance(meta, dict):
-        return meta
-    if isinstance(meta, str):
-        try:
-            parsed = json.loads(meta)
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            return {}
-    return {}
-
-
 def _active_hallucination_events(
     events: Iterable[Any],
     kind: str,
@@ -947,43 +914,6 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
-def _rule_incomplete_handoff(task, events, runs, now, cfg) -> list[Diagnostic]:
-    if _task_field(task, "status") != "done":
-        return []
-    completed_runs = [r for r in runs if _task_field(r, "outcome") == "completed"]
-    if not completed_runs:
-        return []
-    latest = max(completed_runs, key=lambda r: int(_task_field(r, "ended_at", 0) or 0))
-    metadata = _run_metadata(latest)
-    if not metadata or not any(field in metadata for field in _HANDOFF_REQUIRED_FIELDS):
-        return []
-    missing = [f for f in _HANDOFF_REQUIRED_FIELDS if not _handoff_has_value(metadata.get(f))]
-    if not missing:
-        return []
-    ended_at = int(_task_field(latest, "ended_at", 0) or now)
-    return [Diagnostic(
-        kind="incomplete_handoff",
-        severity="warning",
-        title="Completion handoff is thin",
-        detail=(
-            "The latest completed run is missing structured handoff fields: "
-            + ", ".join(missing)
-            + ". Add result/evidence/decisions/risks/next_handoff/badream_context so the next owner can verify or continue."
-        ),
-        actions=[DiagnosticAction(
-            kind="comment",
-            label="Add structured handoff details",
-            payload={"missing_fields": missing},
-            suggested=True,
-        )],
-        first_seen_at=ended_at,
-        last_seen_at=ended_at,
-        count=1,
-        run_id=_task_field(latest, "run_id", _task_field(latest, "id")),
-        data={"missing_fields": missing},
-    )]
-
-
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
@@ -992,7 +922,6 @@ _RULES: list[RuleFn] = [
     _rule_prose_phantom_refs,
     _rule_repeated_failures,
     _rule_repeated_crashes,
-    _rule_incomplete_handoff,
     _rule_stuck_in_blocked,
     _rule_stranded_in_ready,
 ]
@@ -1006,7 +935,6 @@ DIAGNOSTIC_KINDS = (
     "prose_phantom_refs",
     "repeated_failures",
     "repeated_crashes",
-    "incomplete_handoff",
     "stuck_in_blocked",
     "stranded_in_ready",
 )
