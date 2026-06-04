@@ -927,8 +927,29 @@ class TestIncomingDocumentHandling:
         assert msg_event.media_types == ["application/zip"]
 
     @pytest.mark.asyncio
-    async def test_oversized_document_skipped(self, adapter):
-        """A document over 20MB should be skipped."""
+    async def test_large_pdf_under_safety_cap_cached(self, adapter):
+        """Large Slack PDFs (for example 29MB scans) should not be silently skipped."""
+        pdf_bytes = b"%PDF-1.4 large fake content"
+
+        with patch.object(adapter, "_download_slack_file_bytes", new_callable=AsyncMock) as dl:
+            dl.return_value = pdf_bytes
+            event = self._make_event(files=[{
+                "mimetype": "application/pdf",
+                "name": "large-scan.pdf",
+                "url_private_download": "https://files.slack.com/large-scan.pdf",
+                "size": 29 * 1024 * 1024,
+            }])
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.DOCUMENT
+        assert len(msg_event.media_urls) == 1
+        assert msg_event.media_types == ["application/pdf"]
+
+    @pytest.mark.asyncio
+    async def test_oversized_document_skipped_with_notice(self, adapter, monkeypatch):
+        """A document above the configured safety cap should be skipped with a visible notice."""
+        monkeypatch.setenv("SLACK_MAX_DOCUMENT_BYTES", str(10 * 1024 * 1024))
         event = self._make_event(files=[{
             "mimetype": "application/pdf",
             "name": "huge.pdf",
@@ -939,6 +960,8 @@ class TestIncomingDocumentHandling:
 
         msg_event = adapter.handle_message.call_args[0][0]
         assert len(msg_event.media_urls) == 0
+        assert "[Slack attachment notice]" in msg_event.text
+        assert "huge.pdf" in msg_event.text
 
     @pytest.mark.asyncio
     async def test_document_download_error_handled(self, adapter):

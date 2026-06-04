@@ -2119,11 +2119,22 @@ class SlackAdapter(BasePlatformAdapter):
                     if ext not in SUPPORTED_DOCUMENT_TYPES:
                         continue  # Skip unsupported file types silently
 
-                    # Check file size (Slack limit: 20 MB for bots)
-                    file_size = f.get("size", 0)
-                    MAX_DOC_BYTES = 20 * 1024 * 1024
-                    if not file_size or file_size > MAX_DOC_BYTES:
-                        logger.warning("[Slack] Document too large or unknown size: %s", file_size)
+                    # Check file size before downloading. Slack file uploads commonly
+                    # exceed 20MB (PDF scans, decks, ZIPs), and bots can still read
+                    # private file URLs when scoped correctly. Keep a conservative
+                    # safety cap, but do not silently drop normal large PDFs like a
+                    # 29MB certificate bundle. Unknown size is allowed and the actual
+                    # download path remains responsible for auth/network failures.
+                    file_size = int(f.get("size") or 0)
+                    MAX_DOC_BYTES = int(os.environ.get("SLACK_MAX_DOCUMENT_BYTES", str(100 * 1024 * 1024)))
+                    if file_size > MAX_DOC_BYTES:
+                        detail = (
+                            f"Slack attachment {original_filename or f.get('id') or 'document'} was skipped "
+                            f"because it is {file_size} bytes, above the configured limit "
+                            f"({MAX_DOC_BYTES} bytes)."
+                        )
+                        attachment_notices.append(detail)
+                        logger.warning("[Slack] %s", detail)
                         continue
 
                     # Download and cache
