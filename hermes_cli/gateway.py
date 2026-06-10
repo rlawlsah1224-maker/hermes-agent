@@ -3056,18 +3056,17 @@ def launchd_restart():
 
     try:
         pid = get_running_pid()
-        if pid is not None and _request_gateway_self_restart(pid):
-            print("✓ Service restart requested")
-            return
         if pid is not None:
-            try:
-                terminate_pid(pid, force=False)
-            except (ProcessLookupError, PermissionError, OSError):
-                pid = None
-            if pid is not None:
-                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
-                if not exited:
-                    print(f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart")
+            print(f"⏳ Launchd service restarting gracefully (PID {pid})...")
+            if _graceful_restart_via_sigusr1(pid, drain_timeout + 5):
+                # The gateway exits with code 75 for a planned service restart.
+                # launchd should relaunch because KeepAlive.SuccessfulExit=false;
+                # kickstart is a harmless nudge if the job is still loaded but
+                # not yet running after the old process exits.
+                subprocess.run(["launchctl", "kickstart", target], check=False, timeout=30)
+                print("✓ Service restarted")
+                return
+            print(f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart")
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         print("✓ Service restarted")
     except subprocess.CalledProcessError as e:

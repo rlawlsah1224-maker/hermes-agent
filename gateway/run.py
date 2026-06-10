@@ -9999,11 +9999,14 @@ class GatewayRunner:
         # Docker/Podman container, use the service restart path: exit with
         # code 75 so the service manager / container restart policy restarts
         # us.  The detached subprocess approach (setsid + bash) doesn't work
-        # under systemd (KillMode=mixed kills the cgroup) or Docker (tini
-        # exits when the gateway dies, taking the detached helper with it).
+        # reliably under service managers: systemd can kill the helper with the
+        # cgroup, and launchd jobs run with parent PID 1 but no INVOCATION_ID,
+        # so an in-gateway /restart used to exit cleanly and leave the job
+        # loaded-but-stopped.
         _under_service = bool(os.environ.get("INVOCATION_ID"))  # systemd sets this
+        _under_launchd = sys.platform == "darwin" and os.getppid() == 1
         _in_container = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
-        if _under_service or _in_container:
+        if _under_service or _under_launchd or _in_container:
             self.request_restart(detached=False, via_service=True)
         else:
             self.request_restart(detached=True, via_service=False)
