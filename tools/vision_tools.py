@@ -253,6 +253,43 @@ def _determine_mime_type(image_path: Path) -> str:
     return mime_types.get(extension, 'image/jpeg')
 
 
+_MODEL_SAFE_IMAGE_MIME = frozenset({
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+})
+
+
+def _normalize_inline_image_bytes(raw: bytes, mime: str) -> "tuple[bytes, str]":
+    """Transcode unsupported inline image bytes to a model-safe format.
+
+    Vision providers only accept jpeg/png/gif/webp inline. BMP/TIFF/HEIC bytes
+    sent as ``data:image/bmp`` etc. return a non-retryable HTTP 400. Convert
+    via Pillow: images with transparency → PNG, otherwise → JPEG. On any
+    failure (Pillow missing / unreadable) return the input unchanged.
+    """
+    if mime in _MODEL_SAFE_IMAGE_MIME:
+        return raw, mime
+    try:
+        import io
+        from PIL import Image
+    except Exception:
+        logger.warning("vision: cannot normalize %s — Pillow unavailable", mime)
+        return raw, mime
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            has_alpha = img.mode in ("RGBA", "LA", "PA") or (
+                img.mode == "P" and "transparency" in img.info
+            )
+            buf = io.BytesIO()
+            if has_alpha:
+                img.convert("RGBA").save(buf, format="PNG")
+                return buf.getvalue(), "image/png"
+            img.convert("RGB").save(buf, format="JPEG", quality=90)
+            return buf.getvalue(), "image/jpeg"
+    except Exception as exc:
+        logger.warning("vision: failed to normalize %s — %s", mime, exc)
+        return raw, mime
+
+
 def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None) -> str:
     """
     Convert an image file to a base64-encoded data URL.
@@ -266,16 +303,22 @@ def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None)
     """
     # Read the image as bytes
     data = image_path.read_bytes()
-    
-    # Encode to base64
-    encoded = base64.b64encode(data).decode("ascii")
-    
+
     # Determine MIME type
     mime = mime_type or _determine_mime_type(image_path)
-    
+
+    # Transcode unsupported inline formats (BMP, TIFF, HEIC, ...) to a
+    # model-safe format. Vision providers only accept jpeg/png/gif/webp inline;
+    # sending data:image/bmp returns a non-retryable HTTP 400. BMP certificates
+    # are a normal incoming format for BaDream insurance operations.
+    data, mime = _normalize_inline_image_bytes(data, mime)
+
+    # Encode to base64
+    encoded = base64.b64encode(data).decode("ascii")
+
     # Create data URL
     data_url = f"data:{mime};base64,{encoded}"
-    
+
     return data_url
 
 

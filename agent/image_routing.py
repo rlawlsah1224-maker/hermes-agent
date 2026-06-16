@@ -295,6 +295,54 @@ def _guess_mime(path: Path, raw: Optional[bytes] = None) -> str:
     }.get(suffix, "image/jpeg")
 
 
+# MIME types the major vision providers accept inline. Anything outside this
+# set (BMP, TIFF, HEIC, ...) must be transcoded to a model-safe format before
+# we embed it as a data URL, or the provider returns a non-retryable HTTP 400
+# ("does not represent a valid image" / "supported image formats: ..."). BMP
+# certificates are a normal incoming format for BaDream insurance operations.
+_MODEL_SAFE_IMAGE_MIME = frozenset({
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+})
+
+
+def _normalize_inline_image(raw: bytes, mime: str) -> Tuple[bytes, str]:
+    """Transcode unsupported inline image bytes to a model-safe format.
+
+    Returns (bytes, mime). If *mime* is already model-safe, the input is
+    returned unchanged. Otherwise we try Pillow to convert: images with an
+    alpha/transparency channel → PNG (lossless, preserves transparency),
+    everything else → JPEG. If Pillow is unavailable or the convert fails,
+    the original bytes/mime are returned (best effort — the provider may
+    still reject, but we never crash the turn).
+    """
+    if mime in _MODEL_SAFE_IMAGE_MIME:
+        return raw, mime
+    try:
+        import io
+        from PIL import Image
+    except Exception:
+        logger.warning(
+            "image_routing: cannot normalize %s — Pillow unavailable", mime
+        )
+        return raw, mime
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            has_alpha = img.mode in ("RGBA", "LA", "PA") or (
+                img.mode == "P" and "transparency" in img.info
+            )
+            buf = io.BytesIO()
+            if has_alpha:
+                img.convert("RGBA").save(buf, format="PNG")
+                return buf.getvalue(), "image/png"
+            img.convert("RGB").save(buf, format="JPEG", quality=90)
+            return buf.getvalue(), "image/jpeg"
+    except Exception as exc:
+        logger.warning(
+            "image_routing: failed to normalize %s — %s", mime, exc
+        )
+        return raw, mime
+
+
 def _file_to_data_url(path: Path) -> Optional[str]:
     """Encode a local image as a base64 data URL at its native size.
 
@@ -313,6 +361,7 @@ def _file_to_data_url(path: Path) -> Optional[str]:
         logger.warning("image_routing: failed to read %s — %s", path, exc)
         return None
     mime = _guess_mime(path, raw=raw)
+    raw, mime = _normalize_inline_image(raw, mime)
     b64 = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{b64}"
 

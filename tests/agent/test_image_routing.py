@@ -449,3 +449,44 @@ class TestLargeImageHandling:
         assert len(parts) == 2
         assert parts[0]["type"] == "text"
         assert parts[1]["type"] == "image_url"
+
+
+class TestBmpInlineNormalization:
+    """BMP (and other unsupported inline formats) must be transcoded to a
+    model-safe MIME before embedding, or providers return a non-retryable
+    HTTP 400. Regression for the recurring Slack BMP insurance-cert failure."""
+
+    @staticmethod
+    def _bmp_bytes(mode: str = "RGB"):
+        import io
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new(mode, (32, 24), (200, 30, 30) if mode == "RGB" else 128).save(
+            buf, format="BMP"
+        )
+        return buf.getvalue()
+
+    def test_file_to_data_url_converts_bmp(self, tmp_path: Path):
+        from agent.image_routing import _file_to_data_url
+        p = tmp_path / "보험가입증명서.bmp"
+        p.write_bytes(self._bmp_bytes())
+        url = _file_to_data_url(p)
+        assert url is not None
+        assert url.startswith("data:image/jpeg") or url.startswith("data:image/png")
+        assert not url.startswith("data:image/bmp")
+
+    def test_build_native_parts_converts_bmp(self, tmp_path: Path):
+        from agent.image_routing import build_native_content_parts
+        p = tmp_path / "cert.bmp"
+        p.write_bytes(self._bmp_bytes())
+        parts, skipped = build_native_content_parts("등록해줘", [str(p)])
+        assert skipped == []
+        img_parts = [x for x in parts if x.get("type") == "image_url"]
+        assert len(img_parts) == 1
+        assert not img_parts[0]["image_url"]["url"].startswith("data:image/bmp")
+
+    def test_supported_mime_passes_through_unchanged(self):
+        from agent.image_routing import _normalize_inline_image
+        raw = b"\x89PNG\r\n\x1a\n" + b"rest"
+        out, mime = _normalize_inline_image(raw, "image/png")
+        assert out == raw and mime == "image/png"

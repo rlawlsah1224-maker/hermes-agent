@@ -164,6 +164,29 @@ class TestImageToBase64DataUrl:
         with pytest.raises(FileNotFoundError):
             _image_to_base64_data_url(tmp_path / "nonexistent.png")
 
+    def test_bmp_is_normalized_to_model_safe_mime(self, tmp_path):
+        """BMP must be transcoded — providers reject data:image/bmp with a
+        non-retryable 400. Regression for the Slack BMP insurance-cert bug."""
+        import io
+        from PIL import Image
+        img = tmp_path / "보험가입증명서.bmp"
+        buf = io.BytesIO()
+        Image.new("RGB", (32, 24), (200, 30, 30)).save(buf, format="BMP")
+        img.write_bytes(buf.getvalue())
+        result = _image_to_base64_data_url(img)
+        assert result.startswith("data:image/jpeg") or result.startswith("data:image/png")
+        assert not result.startswith("data:image/bmp")
+
+    def test_bmp_with_explicit_bmp_mime_is_still_normalized(self, tmp_path):
+        import io
+        from PIL import Image
+        img = tmp_path / "cert.bmp"
+        buf = io.BytesIO()
+        Image.new("RGB", (16, 16), (0, 0, 255)).save(buf, format="BMP")
+        img.write_bytes(buf.getvalue())
+        result = _image_to_base64_data_url(img, mime_type="image/bmp")
+        assert not result.startswith("data:image/bmp")
+
 
 # ---------------------------------------------------------------------------
 # _handle_vision_analyze — type signature & behavior
